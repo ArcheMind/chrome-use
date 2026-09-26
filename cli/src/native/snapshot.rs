@@ -740,6 +740,7 @@ async fn take_snapshot_at_depth(
             actual_nth,
             frame_id,
         );
+        ref_map.set_identity_name(&ref_id, &tree_nodes[*idx].ax_name);
         ref_map.set_fingerprint(&ref_id, build_ax_fingerprint(&tree_nodes, *idx));
 
         tree_nodes[*idx].has_ref = true;

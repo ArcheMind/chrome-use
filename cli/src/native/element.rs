@@ -107,7 +107,13 @@ pub(crate) fn read_editable_value_function() -> String {
 pub struct RefEntry {
     pub backend_node_id: Option<i64>,
     pub role: String,
+    /// Name rendered in snapshots and exposed to callers. AX snapshots may
+    /// synthesize this from descendant text when Chrome's raw AX name is empty.
     pub name: String,
+    /// Raw AX name used for identity checks and re-anchoring. This must stay
+    /// separate from `name`: comparing a synthesized label to the raw AX tree
+    /// makes a ref reject the unchanged node that produced it.
+    pub identity_name: String,
     pub nth: Option<usize>,
     pub selector: Option<String>,
     pub frame_id: Option<String>,
@@ -299,6 +305,7 @@ impl RefMap {
                 backend_node_id,
                 role: role.to_string(),
                 name: name.to_string(),
+                identity_name: name.to_string(),
                 nth,
                 selector: None,
                 frame_id: frame_id.map(|s| s.to_string()),
@@ -306,6 +313,13 @@ impl RefMap {
                 dom_sourced: false,
             },
         );
+    }
+
+    /// Preserve the raw AX name when the snapshot rendered a synthesized name.
+    pub fn set_identity_name(&mut self, ref_id: &str, identity_name: &str) {
+        if let Some(entry) = self.map.get_mut(ref_id) {
+            entry.identity_name = identity_name.to_string();
+        }
     }
 
     /// Flag a ref as minted by the DOM-walk fallback snapshot (#206).
@@ -337,6 +351,7 @@ impl RefMap {
                 backend_node_id: None,
                 role: role.to_string(),
                 name: name.to_string(),
+                identity_name: name.to_string(),
                 nth,
                 selector: Some(selector),
                 frame_id: None,
@@ -553,7 +568,8 @@ async fn reanchor_ref(
         .iter()
         .filter(|n| !n.ignored.unwrap_or(false))
         .filter(|n| {
-            extract_ax_string(&n.role) == entry.role && extract_ax_string(&n.name) == entry.name
+            extract_ax_string(&n.role) == entry.role
+                && extract_ax_string(&n.name) == entry.identity_name
         })
         .filter_map(|n| {
             n.backend_d_o_m_node_id
@@ -570,7 +586,7 @@ async fn reanchor_ref(
     }
 
     let by_value = entry
-        .name
+        .identity_name
         .is_empty()
         .then(|| fingerprint_value(entry))
         .flatten()
@@ -669,7 +685,7 @@ async fn confirmed_backend_node_id(
         backend_node_id,
         ref_id,
         &entry.role,
-        &entry.name,
+        &entry.identity_name,
     )
     .await
     else {
@@ -732,10 +748,17 @@ async fn confirmed_backend_node_id(
 /// works. A fresh `snapshot` does help: it numbers duplicates, so the new ref
 /// carries the ordinal this one lacked.
 fn indistinguishable_ref_error(ref_id: &str, entry: &RefEntry, candidates: usize) -> String {
-    let identity = if entry.name.is_empty() {
-        format!("{} with no accessible name", entry.role)
+    let identity = if entry.identity_name.is_empty() {
+        if entry.name.is_empty() {
+            format!("{} with no accessible name", entry.role)
+        } else {
+            format!(
+                "{} with no accessible name (rendered as \"{}\" from fallback text)",
+                entry.role, entry.name
+            )
+        }
     } else {
-        format!("{} \"{}\"", entry.role, entry.name)
+        format!("{} \"{}\"", entry.role, entry.identity_name)
     };
     let value_hint = match fingerprint_value(entry) {
         Some(v) => format!(
@@ -836,7 +859,7 @@ pub async fn resolve_element_center(
             client,
             session_id,
             &entry.role,
-            &entry.name,
+            &entry.identity_name,
             entry.nth,
             entry.frame_id.as_deref(),
             iframe_sessions,
@@ -930,7 +953,7 @@ pub async fn resolve_element_object_id(
             client,
             session_id,
             &entry.role,
-            &entry.name,
+            &entry.identity_name,
             entry.nth,
             entry.frame_id.as_deref(),
             iframe_sessions,
@@ -2942,6 +2965,17 @@ mod tests {
         assert_eq!(pick_by_value(&dupes, "same"), None);
     }
 
+    #[test]
+    fn a_synthesized_snapshot_label_does_not_replace_the_raw_ax_identity() {
+        let mut refs = RefMap::new();
+        refs.add_with_frame("e1".to_string(), Some(7), "generic", "141关注", None, None);
+        refs.set_identity_name("e1", "");
+
+        let entry = refs.get("e1").expect("ref should be recorded");
+        assert_eq!(entry.name, "141关注");
+        assert_eq!(entry.identity_name, "");
+    }
+
     /// The failure this issue is about is not "the element vanished" but "there
     /// are several and nothing tells them apart". Reporting the second as the
     /// first sends the agent hunting for a disappearance that never happened.
@@ -2951,6 +2985,7 @@ mod tests {
             backend_node_id: Some(7),
             role: "combobox".to_string(),
             name: String::new(),
+            identity_name: String::new(),
             nth: None,
             selector: None,
             frame_id: None,
