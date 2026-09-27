@@ -5781,9 +5781,12 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         // `--follow`: switch the active tab to the newly-opened one (default is
         // to report it but stay put, so multi-tab flows aren't hijacked).
         if follow {
-            let old_target = mgr.active_target_id().ok().map(ToString::to_string);
-            let new_target = mgr.target_id_for_tab(page.tab_id).map(ToString::to_string);
-            let _ = mgr.tab_switch_by_id(page.tab_id).await;
+            let (old_target, new_target) = {
+                let old_target = mgr.active_target_id().ok().map(ToString::to_string);
+                let new_target = mgr.target_id_for_tab(page.tab_id).map(ToString::to_string);
+                mgr.tab_switch_by_id(page.tab_id).await?;
+                (old_target, new_target)
+            };
             if let Some(ref new_t) = new_target {
                 state.switch_tab_context(old_target.as_deref(), new_t);
             } else {
@@ -5791,10 +5794,47 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
                 state.iframe_sessions.clear();
                 state.active_frame_id = None;
             }
+            let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
+            wait_for_followed_tab_commit(mgr, &page.url).await?;
             out["followed"] = json!(true);
         }
     }
     Ok(out)
+}
+
+fn followed_tab_commit_pending(opened_url: &str, current_url: &str) -> bool {
+    !is_blank_capture_target(opened_url) && is_blank_capture_target(current_url)
+}
+
+async fn wait_for_followed_tab_commit(
+    mgr: &mut super::browser::BrowserManager,
+    opened_url: &str,
+) -> Result<(), String> {
+    if is_blank_capture_target(opened_url) {
+        return Ok(());
+    }
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut current_url = String::new();
+    while tokio::time::Instant::now() < deadline {
+        match mgr.get_url().await {
+            Ok(url) => {
+                current_url = url;
+                if !followed_tab_commit_pending(opened_url, &current_url) {
+                    return Ok(());
+                }
+            }
+            Err(_) if mgr.on_relay() => {
+                mgr.reattach_active_session().await?;
+            }
+            Err(error) => return Err(error),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    Err(format!(
+        "Followed tab did not commit its initial navigation within 2s (opened: {opened_url}, current: {current_url})"
+    ))
 }
 
 async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -15087,6 +15127,32 @@ mod tests {
             "http://127.0.0.1:8791/design.html"
         ));
         assert!(!is_blank_capture_target("https://example.com/"));
+    }
+
+    #[test]
+    fn followed_real_tab_waits_for_its_initial_navigation_commit() {
+        assert!(followed_tab_commit_pending(
+            "https://example.com/profile",
+            "about:blank"
+        ));
+        assert!(followed_tab_commit_pending(
+            "https://example.com/profile",
+            ""
+        ));
+        assert!(!followed_tab_commit_pending(
+            "https://example.com/profile",
+            "https://example.com/profile"
+        ));
+        assert!(!followed_tab_commit_pending(
+            "https://example.com/profile",
+            "https://login.example.net/redirect"
+        ));
+    }
+
+    #[test]
+    fn followed_intentionally_blank_tab_does_not_wait() {
+        assert!(!followed_tab_commit_pending("about:blank", "about:blank"));
+        assert!(!followed_tab_commit_pending("", ""));
     }
 
     // issue #184 (reporter suggestion 3): the URL guard only catches a drift the
